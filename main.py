@@ -4,7 +4,7 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
-
+from dotenv import load_dotenv
 import ccxt
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -292,7 +292,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def main():
+def main():load_dotenv()
     if not TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN as a secret environment variable.")
     app = (Application.builder().token(TOKEN).post_init(post_init)
