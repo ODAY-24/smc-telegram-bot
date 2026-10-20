@@ -4,14 +4,20 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
+    disk:
+      name: smc-bot-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: EXCHANGE_ID
         value: binance
-      - key: DEFAULT_SYMBOL
-        value: BTC/USDT
       - key: DEFAULT_TIMEFRAME
         value: 15m
-      - key: OHLCV_LIMIT
-        value: "150"
+      - key: SCAN_SECONDS
+        value: "60"
+      - key: WATCHLIST
+        value: BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,DOGE/USDT,ADA/USDT,AVAX/USDT,LINK/USDT,SHIB/USDT,PEPE/USDT,BONK/USDT,WIF/USDT,FLOKI/USDT
+      - key: DB_PATH
+        value: /var/data/smc_bot.db
