@@ -1,147 +1,306 @@
-"""SMC Telegram bot starter: analysis only; it never places trading orders."""
+"""Multi-user SMC crypto signal bot. Signals only; never places orders."""
 import asyncio
 import logging
 import os
-import re
+import sqlite3
+from datetime import datetime, timezone
 
 import ccxt
-import pandas as pd
-from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-load_dotenv()
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
-                    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-log = logging.getLogger("smc-bot")
-
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binance").strip().lower()
-DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "BTC/USDT").strip().upper()
-DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "15m").strip()
-OHLCV_LIMIT = max(60, min(int(os.getenv("OHLCV_LIMIT", "150")), 500))
-TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"}
-SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}/[A-Z0-9]{2,20}$")
+TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "15m").strip()
+SCAN_SECONDS = max(30, int(os.getenv("SCAN_SECONDS", "60")))
+DB_PATH = os.getenv("DB_PATH", "/var/data/smc_bot.db")
+WATCHLIST = [s.strip().upper() for s in os.getenv(
+    "WATCHLIST",
+    "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,DOGE/USDT,ADA/USDT,AVAX/USDT,"
+    "LINK/USDT,SHIB/USDT,PEPE/USDT,BONK/USDT,WIF/USDT,FLOKI/USDT"
+).split(",") if s.strip()]
+LIMIT = 100
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
+                    format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("smc-bot")
+_exchange = None
+_exchange_lock = asyncio.Lock()
 
 
-def analyze_ohlcv(rows):
-    if len(rows) < 30:
-        raise ValueError("Need at least 30 candles.")
-    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
-    df = df.iloc[:-1].reset_index(drop=True)  # ignore forming candle
-    if len(df) < 25:
-        raise ValueError("Not enough completed candles.")
-    last = df.iloc[-1]
-    prior = df.iloc[-21:-1]
-    close, high, low = float(last.close), float(last.high), float(last.low)
-    p_high, p_low = float(prior.high.max()), float(prior.low.min())
-    if close > p_high:
-        structure = "Bullish BOS: close broke prior 20-candle high"
-    elif close < p_low:
-        structure = "Bearish BOS: close broke prior 20-candle low"
-    else:
-        structure = "No confirmed 20-candle BOS"
-
-    a, c = df.iloc[-3], df.iloc[-1]
-    if float(a.high) < float(c.low):
-        fvg = f"Bullish FVG: {float(a.high):.8g} – {float(c.low):.8g}"
-    elif float(a.low) > float(c.high):
-        fvg = f"Bearish FVG: {float(c.high):.8g} – {float(a.low):.8g}"
-    else:
-        fvg = "No fresh three-candle FVG detected"
-
-    if high > p_high and close < p_high:
-        sweep = "Possible buy-side liquidity sweep"
-    elif low < p_low and close > p_low:
-        sweep = "Possible sell-side liquidity sweep"
-    else:
-        sweep = "No obvious liquidity sweep on latest completed candle"
-    return {"close": close, "structure": structure, "fvg": fvg, "sweep": sweep}
+def connect_db():
+    folder = os.path.dirname(DB_PATH)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    con = sqlite3.connect(DB_PATH, timeout=20)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("""CREATE TABLE IF NOT EXISTS users (
+        chat_id INTEGER PRIMARY KEY, joined_at TEXT NOT NULL)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
+        direction TEXT NOT NULL, entry REAL NOT NULL, stop REAL NOT NULL, target REAL NOT NULL,
+        status TEXT NOT NULL, candle_ts INTEGER NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE(symbol, timeframe, candle_ts, direction))""")
+    con.execute("""CREATE TABLE IF NOT EXISTS recipients (
+        signal_id INTEGER NOT NULL, chat_id INTEGER NOT NULL,
+        PRIMARY KEY(signal_id, chat_id))""")
+    con.commit()
+    return con
 
 
-def exchange_client():
-    cls = getattr(ccxt, EXCHANGE_ID, None)
-    if cls is None:
-        raise ValueError(f"Unknown exchange: {EXCHANGE_ID}")
-    ex = cls({"enableRateLimit": True, "timeout": 15000})
-    if not ex.has.get("fetchOHLCV"):
-        raise ValueError("This exchange does not support OHLCV candles.")
-    return ex
+def utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def analyze(rows):
+    # Only completed candles are considered; last row is usually still forming.
+    if len(rows) < 35:
+        return None
+    candles = rows[:-1]
+    prior = candles[-21:-1]
+    last = candles[-1]
+    previous = candles[-2]
+    close = float(last[4])
+    high, low = float(last[2]), float(last[3])
+    prior_high = max(float(c[2]) for c in prior)
+    prior_low = min(float(c[3]) for c in prior)
+    recent_lows = [float(c[3]) for c in candles[-8:]]
+    recent_highs = [float(c[2]) for c in candles[-8:]]
+    a, c = candles[-3], candles[-1]
+    bull_fvg = float(a[2]) < float(c[3])
+    bear_fvg = float(a[3]) > float(c[2])
+    bull_sweep = low < prior_low and close > prior_low
+    bear_sweep = high > prior_high and close < prior_high
+    bull_bos = close > prior_high
+    bear_bos = close < prior_low
+
+    # Conservative prototype: require a structure break plus an FVG or sweep.
+    if bull_bos and (bull_fvg or bull_sweep):
+        entry = close
+        stop = min(recent_lows)
+        risk = entry - stop
+        if risk <= 0 or risk / entry > 0.08:
+            return None
+        return {"direction": "LONG", "entry": entry, "stop": stop,
+                "target": entry + 2 * risk, "ts": int(last[0])}
+    if bear_bos and (bear_fvg or bear_sweep):
+        entry = close
+        stop = max(recent_highs)
+        risk = stop - entry
+        if risk <= 0 or risk / entry > 0.08:
+            return None
+        return {"direction": "SHORT", "entry": entry, "stop": stop,
+                "target": entry - 2 * risk, "ts": int(last[0])}
+    return None
+
+
+async def get_exchange():
+    global _exchange
+    async with _exchange_lock:
+        if _exchange is None:
+            cls = getattr(ccxt, EXCHANGE_ID, None)
+            if cls is None:
+                raise ValueError("Unknown exchange configured")
+            _exchange = cls({"enableRateLimit": True, "timeout": 20000})
+            await asyncio.to_thread(_exchange.load_markets)
+        return _exchange
+
+
+def fmt(value):
+    return f"{value:.8g}"
+
+
+async def send_to_recipients(app, signal_id, message):
+    con = connect_db()
+    ids = [r[0] for r in con.execute(
+        "SELECT chat_id FROM recipients WHERE signal_id=?", (signal_id,)).fetchall()]
+    con.close()
+    for chat_id in ids:
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=message)
+        except Exception:
+            log.exception("Could not notify chat %s", chat_id)
+
+
+async def scan_once(app):
+    ex = await get_exchange()
+    con = connect_db()
+    users = [r[0] for r in con.execute("SELECT chat_id FROM users").fetchall()]
+    if not users:
+        con.close()
+        return
+    for symbol in WATCHLIST:
+        try:
+            if symbol not in ex.markets:
+                continue
+            rows = await asyncio.to_thread(ex.fetch_ohlcv, symbol, TIMEFRAME, None, LIMIT)
+            setup = analyze(rows)
+            if not setup:
+                continue
+            created = utc_now()
+            try:
+                cur = con.execute(
+                    """INSERT INTO signals(symbol,timeframe,direction,entry,stop,target,status,candle_ts,created_at)
+                    VALUES(?,?,?,?,?,?, 'OPEN',?,?)""",
+                    (symbol, TIMEFRAME, setup["direction"], setup["entry"], setup["stop"],
+                     setup["target"], setup["ts"], created))
+                signal_id = cur.lastrowid
+            except sqlite3.IntegrityError:
+                continue
+            con.executemany("INSERT OR IGNORE INTO recipients(signal_id,chat_id) VALUES(?,?)",
+                            [(signal_id, chat_id) for chat_id in users])
+            con.commit()
+            message = (
+                f"📊 إشارة SMC جديدة — {symbol}\\n"
+                f"الاتجاه: {setup['direction']} (إشارة فقط)\\n"
+                f"الإطار: {TIMEFRAME}\\nالدخول المرجعي: {fmt(setup['entry'])}\\n"
+                f"وقف الخسارة: {fmt(setup['stop'])}\\nالهدف (2R): {fmt(setup['target'])}\\n"
+                f"السبب: كسر هيكل مع FVG أو سحب سيولة\\nوقت الإشارة: {created}\\n\\n"
+                "راقب التنفيذ يدويًا؛ النتائج غير مضمونة."
+            )
+            await send_to_recipients(app, signal_id, message)
+        except Exception:
+            log.exception("Scan failed for %s", symbol)
+    con.close()
+
+
+async def monitor_once(app):
+    con = connect_db()
+    active = con.execute(
+        "SELECT id,symbol,direction,entry,stop,target FROM signals WHERE status='OPEN'"
+    ).fetchall()
+    con.close()
+    if not active:
+        return
+    ex = await get_exchange()
+    for signal_id, symbol, direction, entry, stop, target in active:
+        try:
+            ticker = await asyncio.to_thread(ex.fetch_ticker, symbol)
+            price = float(ticker.get("last") or 0)
+            if price <= 0:
+                continue
+            status = None
+            if direction == "LONG":
+                if price <= stop:
+                    status = "STOP"
+                elif price >= target:
+                    status = "TARGET"
+            else:
+                if price >= stop:
+                    status = "STOP"
+                elif price <= target:
+                    status = "TARGET"
+            if status:
+                con = connect_db()
+                cur = con.execute(
+                    "UPDATE signals SET status=? WHERE id=? AND status='OPEN'",
+                    (status, signal_id))
+                con.commit()
+                con.close()
+                if cur.rowcount:
+                    label = "تحقق الهدف" if status == "TARGET" else "وصل السعر إلى وقف الخسارة"
+                    await send_to_recipients(
+                        app, signal_id,
+                        f"🔔 تحديث الإشارة — {symbol}\\n{label}\\n"
+                        f"السعر المرصود: {fmt(price)}\\nالاتجاه: {direction}\\n"
+                        "هذه متابعة سعرية للإشارة وليست سجل تنفيذ فعلي."
+                    )
+        except Exception:
+            log.exception("Monitor failed for %s", symbol)
+
+
+async def background_loop(app):
+    await asyncio.sleep(3)
+    while True:
+        try:
+            await scan_once(app)
+            await monitor_once(app)
+        except Exception:
+            log.exception("Background cycle failed")
+        await asyncio.sleep(SCAN_SECONDS)
+
+
+async def post_init(app):
+    app.bot_data["scanner_task"] = asyncio.create_task(background_loop(app))
+    log.info("SMC scanner started: %d symbols", len(WATCHLIST))
+
+
+async def post_shutdown(app):
+    task = app.bot_data.get("scanner_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(
-            "مرحباً بك في بوت SMC التجريبي.\n"
-            "/analyze BTC/USDT 15m — تحليل السوق\n"
-            "/status — حالة الإعدادات\n/help — المساعدة\n\n"
-            "تحليل فقط؛ لا ينفّذ صفقات."
-        )
+    if not update.effective_chat or not update.effective_user:
+        return
+    con = connect_db()
+    con.execute("INSERT OR IGNORE INTO users(chat_id,joined_at) VALUES(?,?)",
+                (update.effective_chat.id, utc_now()))
+    con.commit()
+    con.close()
+    await update.effective_message.reply_text(
+        "أهلًا بك في بوت إشارات SMC للعملات الرقمية والميم كوين.\\n"
+        "تم تفعيل استقبال الإشارات والتحديثات لهذا الحساب.\\n\\n"
+        "/signals — إشاراتك المفتوحة\\n/stopalerts — إيقاف التنبيهات\\n"
+        "/start — إعادة تفعيل التنبيهات\\n/help — المساعدة\\n\\n"
+        "إشارات فقط؛ لا ينفّذ البوت صفقات. لا توجد ضمانات للربح."
+    )
+
+
+async def stopalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat:
+        return
+    con = connect_db()
+    con.execute("DELETE FROM users WHERE chat_id=?", (update.effective_chat.id,))
+    con.commit()
+    con.close()
+    await update.effective_message.reply_text(
+        "تم إيقاف التنبيهات لهذا الحساب. أرسل /start لإعادة تفعيلها."
+    )
+
+
+async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat:
+        return
+    con = connect_db()
+    rows = con.execute(
+        """SELECT s.symbol,s.direction,s.entry,s.stop,s.target,s.status,s.created_at
+        FROM signals s JOIN recipients r ON r.signal_id=s.id
+        WHERE r.chat_id=? ORDER BY s.id DESC LIMIT 15""",
+        (update.effective_chat.id,)).fetchall()
+    con.close()
+    if not rows:
+        await update.effective_message.reply_text("لا توجد إشارات مسجلة لهذا الحساب حتى الآن.")
+        return
+    lines = ["آخر إشاراتك:"]
+    for symbol, direction, entry, stop, target, status, created in rows:
+        lines.append(f"{symbol} {direction} | {status}\\nدخول {fmt(entry)} · وقف {fmt(stop)} · هدف {fmt(target)}\\n{created}")
+    await update.effective_message.reply_text("\\n\\n".join(lines))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(
-            "الاستخدام: /analyze SYMBOL TIMEFRAME\n"
-            f"مثال: /analyze {DEFAULT_SYMBOL} {DEFAULT_TIMEFRAME}\n"
-            "الأطر: " + ", ".join(sorted(TIMEFRAMES)) +
-            "\nالتحليل تجريبي وليس توصية مالية."
-        )
-
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(
-            f"المنصة: {EXCHANGE_ID}\nالزوج الافتراضي: {DEFAULT_SYMBOL}\n"
-            f"الإطار: {DEFAULT_TIMEFRAME}\nوضع التشغيل: تحليل فقط."
-        )
-
-
-async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    symbol = context.args[0].upper() if context.args else DEFAULT_SYMBOL
-    timeframe = context.args[1].lower() if len(context.args) > 1 else DEFAULT_TIMEFRAME
-    if not SYMBOL_RE.fullmatch(symbol):
-        await update.message.reply_text("صيغة الزوج غير صحيحة. مثال: BTC/USDT")
-        return
-    if timeframe not in TIMEFRAMES:
-        await update.message.reply_text("إطار غير مدعوم. استخدم /help.")
-        return
-    await update.message.reply_text(f"جارٍ تحليل {symbol} على {timeframe}...")
-    try:
-        ex = exchange_client()
-        markets = await asyncio.to_thread(ex.load_markets)
-        if symbol not in markets:
-            await update.message.reply_text(f"الزوج {symbol} غير متاح على {EXCHANGE_ID}.")
-            return
-        rows = await asyncio.to_thread(ex.fetch_ohlcv, symbol, timeframe, None, OHLCV_LIMIT)
-        result = analyze_ohlcv(rows)
-        await update.message.reply_text(
-            f"تحليل SMC مبسّط — {symbol} ({timeframe})\n\n"
-            f"آخر إغلاق مكتمل: {result['close']:.8g}\n"
-            f"هيكل السوق: {result['structure']}\n"
-            f"اختلال سعري: {result['fvg']}\n"
-            f"السيولة: {result['sweep']}\n\n"
-            "قواعد أولية وليست توصية أو ضماناً للنتيجة."
-        )
-    except Exception:
-        log.exception("Analysis failed")
-        await update.message.reply_text(
-            "تعذّر التحليل. تحقق من الاتصال واسم المنصة والزوج ثم أعد المحاولة. "
-            "لم يتم تنفيذ أي صفقة."
-        )
+    await update.effective_message.reply_text(
+        "/start — تفعيل التنبيهات\\n/signals — آخر إشاراتك\\n"
+        "/stopalerts — إيقاف التنبيهات\\n\\n"
+        f"المنصة: {EXCHANGE_ID} | الإطار: {TIMEFRAME}\\n"
+        "الرموز التي تتم مراقبتها تضبط عبر WATCHLIST. التحليل تجريبي وقد يعطي إشارات خاطئة."
+    )
 
 
 def main():
-    if not TOKEN or TOKEN == "put_your_telegram_bot_token_here":
-        raise SystemExit("أضف TELEGRAM_BOT_TOKEN في متغيرات البيئة قبل التشغيل.")
-    app = Application.builder().token(TOKEN).build()
+    if not TOKEN:
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN as a secret environment variable.")
+    app = (Application.builder().token(TOKEN).post_init(post_init)
+           .post_shutdown(post_shutdown).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("analyze", analyze))
-    log.info("Starting SMC bot in analysis-only mode")
+    app.add_handler(CommandHandler("signals", signals))
+    app.add_handler(CommandHandler("stopalerts", stopalerts))
+    log.info("Starting signal-only multi-user SMC bot")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
