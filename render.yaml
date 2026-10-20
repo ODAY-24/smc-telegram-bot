@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: smc-telegram-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: EXCHANGE_ID
+        value: binance
+      - key: DEFAULT_SYMBOL
+        value: BTC/USDT
+      - key: DEFAULT_TIMEFRAME
+        value: 15m
+      - key: OHLCV_LIMIT
+        value: "150"
