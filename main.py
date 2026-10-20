@@ -150,11 +150,11 @@ async def scan_once(app):
                             [(signal_id, chat_id) for chat_id in users])
             con.commit()
             message = (
-                f"📊 إشارة SMC جديدة — {symbol}\\n"
-                f"الاتجاه: {setup['direction']} (إشارة فقط)\\n"
-                f"الإطار: {TIMEFRAME}\\nالدخول المرجعي: {fmt(setup['entry'])}\\n"
-                f"وقف الخسارة: {fmt(setup['stop'])}\\nالهدف (2R): {fmt(setup['target'])}\\n"
-                f"السبب: كسر هيكل مع FVG أو سحب سيولة\\nوقت الإشارة: {created}\\n\\n"
+                f"📊 إشارة SMC جديدة — {symbol}\n"
+                f"الاتجاه: {setup['direction']} (إشارة فقط)\n"
+                f"الإطار: {TIMEFRAME}\nالدخول المرجعي: {fmt(setup['entry'])}\n"
+                f"وقف الخسارة: {fmt(setup['stop'])}\nالهدف (2R): {fmt(setup['target'])}\n"
+                f"السبب: كسر هيكل مع FVG أو سحب سيولة\nوقت الإشارة: {created}\n\n"
                 "راقب التنفيذ يدويًا؛ النتائج غير مضمونة."
             )
             await send_to_recipients(app, signal_id, message)
@@ -200,8 +200,8 @@ async def monitor_once(app):
                     label = "تحقق الهدف" if status == "TARGET" else "وصل السعر إلى وقف الخسارة"
                     await send_to_recipients(
                         app, signal_id,
-                        f"🔔 تحديث الإشارة — {symbol}\\n{label}\\n"
-                        f"السعر المرصود: {fmt(price)}\\nالاتجاه: {direction}\\n"
+                        f"🔔 تحديث الإشارة — {symbol}\n{label}\n"
+                        f"السعر المرصود: {fmt(price)}\nالاتجاه: {direction}\n"
                         "هذه متابعة سعرية للإشارة وليست سجل تنفيذ فعلي."
                     )
         except Exception:
@@ -243,10 +243,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     con.commit()
     con.close()
     await update.effective_message.reply_text(
-        "أهلًا بك في بوت إشارات SMC للعملات الرقمية والميم كوين.\\n"
-        "تم تفعيل استقبال الإشارات والتحديثات لهذا الحساب.\\n\\n"
-        "/signals — إشاراتك المفتوحة\\n/stopalerts — إيقاف التنبيهات\\n"
-        "/start — إعادة تفعيل التنبيهات\\n/help — المساعدة\\n\\n"
+        "أهلًا بك في بوت إشارات SMC للعملات الرقمية والميم كوين.\n"
+        "تم تفعيل استقبال الإشارات والتحديثات لهذا الحساب.\n\n"
+        "/signals — إشاراتك المفتوحة\n/stopalerts — إيقاف التنبيهات\n"
+        "/start — إعادة تفعيل التنبيهات\n/help — المساعدة\n\n"
         "إشارات فقط؛ لا ينفّذ البوت صفقات. لا توجد ضمانات للربح."
     )
 
@@ -256,6 +256,7 @@ async def stopalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     con = connect_db()
     con.execute("DELETE FROM users WHERE chat_id=?", (update.effective_chat.id,))
+    con.execute("DELETE FROM recipients WHERE chat_id=?", (update.effective_chat.id,))
     con.commit()
     con.close()
     await update.effective_message.reply_text(
@@ -278,15 +279,15 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["آخر إشاراتك:"]
     for symbol, direction, entry, stop, target, status, created in rows:
-        lines.append(f"{symbol} {direction} | {status}\\nدخول {fmt(entry)} · وقف {fmt(stop)} · هدف {fmt(target)}\\n{created}")
-    await update.effective_message.reply_text("\\n\\n".join(lines))
+        lines.append(f"{symbol} {direction} | {status}\nدخول {fmt(entry)} · وقف {fmt(stop)} · هدف {fmt(target)}\n{created}")
+    await update.effective_message.reply_text("\n\n".join(lines))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "/start — تفعيل التنبيهات\\n/signals — آخر إشاراتك\\n"
-        "/stopalerts — إيقاف التنبيهات\\n\\n"
-        f"المنصة: {EXCHANGE_ID} | الإطار: {TIMEFRAME}\\n"
+        "/start — تفعيل التنبيهات\n/signals — آخر إشاراتك\n"
+        "/stopalerts — إيقاف التنبيهات\n\n"
+        f"المنصة: {EXCHANGE_ID} | الإطار: {TIMEFRAME}\n"
         "الرموز التي تتم مراقبتها تضبط عبر WATCHLIST. التحليل تجريبي وقد يعطي إشارات خاطئة."
     )
 
