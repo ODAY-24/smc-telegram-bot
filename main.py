@@ -9,6 +9,7 @@ import ccxt
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binance").strip().lower()
 TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "15m").strip()
